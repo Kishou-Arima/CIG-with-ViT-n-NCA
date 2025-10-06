@@ -66,7 +66,7 @@ This project is licensed under the MIT License. See the [LICENSE](./LICENSE) fil
 
 If you use this code or ideas in your research, please cite the associated research paper:
 
-> [Conditional Image Generation with Vision Transformers and Neural Cellular Automata]  
+> Conditional Image Generation with Vision Transformers and Neural Cellular Automata  
 > *Author(s): Utkaarsh Saha, Alan Muthappan Rebeira, Dr. Shabnam Sadeghi Esfahlani*  
 > *Year: 2025*  
 > *Anglia Ruskin University, EBE Conference 2025*
