@@ -1,0 +1,13 @@
+# Ignore image files
+*.png
+*.jpg
+*.jpeg
+
+# Ignore PDF documents
+*.pdf
+
+# Ignore PyTorch model files
+*.pt
+
+*.tgz
+*.mat
