@@ -11,5 +11,6 @@
 
 *.tgz
 *.mat
+
 # Ignore notebooks
 *.ipynb

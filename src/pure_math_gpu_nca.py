@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""CLIP-conditioned NCA whose neural-network rollout is explicit GPU math.
-
-This file keeps the parts the project actually needs:
-- CLIP for ViT text embeddings.
-- CuPy for the NCA neural-network math on GPU.
-- Matplotlib for displaying/saving generated outputs.
-
-The NCA itself does not use ``torch.nn`` or a high-level training/inference
-framework.  Its convolution, FiLM conditioning, 1x1 update network, stochastic
-cell mask, and rollout loop are written as array mathematics over CuPy tensors.
-
-Example:
-    python src/pure_math_gpu_nca.py "yellow iris" --output yellow_iris.png --show
-"""
-
 from __future__ import annotations
 
 import argparse

@@ -48,17 +48,37 @@ This project explores Cellular Image Generation (CIG) using Vision Transformers 
 
 ## Pure-math GPU NCA prototype
 
+<<<<<<< ours
+
 A Python prototype is available at `src/pure_math_gpu_nca.py`. It uses the required CLIP ViT text encoder for prompt embeddings, then runs the NCA neural-network rollout as explicit CuPy mathematics on the GPU. Matplotlib is used to save or display the generated output. The NCA path avoids `torch.nn`, torchvision, diffusers, and custom CUDA/C++ code. Dataset training uses Pillow and SciPy only to read Flowers102 images and `.mat` split files, and the default trainer uses backprop through explicit tensor operations before exporting `.npz` weights back to the CuPy inference path.
+=======
+A Python prototype is available at `src/pure_math_gpu_nca.py`. It uses the required CLIP ViT text encoder for prompt embeddings, then runs the NCA neural-network rollout as explicit CuPy mathematics on the GPU. Matplotlib is used to save or display the generated output. The NCA path avoids `torch.nn`, torchvision, diffusers, PIL, and custom CUDA/C++ code.
+>>>>>>> theirs
+=======
+A Python prototype is available at `src/pure_math_gpu_nca.py`. It uses the required CLIP ViT text encoder for prompt embeddings, then runs the NCA neural-network rollout as explicit CuPy mathematics on the GPU. Matplotlib is used to save or display the generated output. The NCA path avoids `torch.nn`, torchvision, diffusers, PIL, and custom CUDA/C++ code.
+>>>>>>> theirs
 
 Install the runtime pieces you actually need:
 
 ```sh
 pip install torch matplotlib
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 pip install pillow scipy
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 pip install git+https://github.com/openai/CLIP.git
 pip install cupy-cuda12x  # choose the CuPy wheel matching your CUDA version
 ```
 
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 Train CuPy NCA weights on the local Flowers102 dataset:
 
 ```sh
@@ -67,18 +87,33 @@ python src/pure_math_gpu_nca.py "yellow iris" --train --train-iters 200 --train-
 
 This reads `src/.dataset/flowers102/flowers-102`, optimizes NCA arrays with backpropagation through the rollout, and saves weights to `src/checkpoints/pure_math_flowers102_nca.npz`. The old finite-difference trainer is still available with `--train-method spsa`.
 
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 Run a generation:
 
 ```sh
 python src/pure_math_gpu_nca.py "yellow iris" --output yellow_iris.png --width 128 --height 128 --steps 48 --show
 ```
 
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 Generate with trained weights:
 
 ```sh
 python src/pure_math_gpu_nca.py "yellow iris" --weights src/checkpoints/pure_math_flowers102_nca.npz --output yellow_iris_trained.png --show
 ```
 
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 See [`docs/PROJECT_UNDERSTANDING.md`](./docs/PROJECT_UNDERSTANDING.md) for a cell-by-cell explanation of `src/file.ipynb`, the dependency gap, and the migration path from the notebook to the CLIP-conditioned CuPy NCA implementation.
 
 ## Checkpoints
@@ -91,7 +126,16 @@ Pretrained model weights for various flowers will be in `src/checkpoints/`. You 
 - PyTorch
 - OpenAI CLIP
 - CuPy (for the pure-math GPU NCA prototype)
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 - Pillow and SciPy (for local Flowers102 training)
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 - torchvision
 - matplotlib
 - diffusers
