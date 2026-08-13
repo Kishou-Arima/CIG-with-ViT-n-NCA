@@ -1,159 +1,79 @@
-# CIG-with-ViT-n-NCA
+# CIG with ViT and NCA
 
-This project explores Cellular Image Generation (CIG) using Vision Transformers (ViT) and Neural Cellular Automata (NCA). It includes code and experiments for generating and evolving images, with a focus on flowers and other natural patterns.
+This research project explores conditional image generation with a CLIP Vision Transformer text encoder and a Neural Cellular Automaton (NCA), with a focus on Flowers102 images.
 
-## Features
+The main implementation is [`src/pure_math_gpu_nca.py`](./src/pure_math_gpu_nca.py). It uses CLIP for text embeddings and performs the NCA rollout as explicit CuPy GPU array mathematics. Torch is used for CLIP and for the optional backpropagation trainer; trained NCA weights are exported as portable `.npz` files for CuPy inference.
 
-- Image generation using Neural Cellular Automata (NCA)
-- Integration with Vision Transformers (ViT) for enhanced pattern recognition
-- Pretrained model checkpoints for various flower types
-- Visualization of generated and trained images
-- Jupyter notebook for interactive experimentation
+## Project layout
 
-## Project Structure
-
-```sh
-├── src/
-│   ├── file.ipynb                # Main Jupyter notebook for experiments
-├── README.md                     # Project documentation
+```text
+src/
+  pure_math_gpu_nca.py     # CLIP-conditioned CuPy NCA and trainer
+  file.ipynb               # Earlier interactive experiments
+  .dataset/flowers102/     # Local Flowers102 dataset (not committed)
+  checkpoints/             # Exported NCA weights
+tests/
+  test_rollout_parity.py   # CuPy/Torch rollout parity regression test
 ```
 
-## Getting Started
+## Setup
 
-1. **Clone the repository**
-
-    ```sh
-    git clone <repo-url>
-    cd CIG-with-ViT-n-NCA
-    ```
-
-2. **Install dependencies**
-
-    ```sh
-        ```sh
-        pip install torch torchvision matplotlib diffusers transformers accelerate safetensors
-        ```
-    - Recommended: Use a virtual environment (e.g., `venv` or `conda`).
-    - Install required packages:
-    
-    ```sh
-    pip install torch torchvision matplotlib diffusers transformers accelerate safetensors
-    ```
-
-3. **Run the notebook**
-
-- Open `src/file.ipynb` in Jupyter Lab or VS Code.
-- Follow the cells to train, generate, and visualize images.
-
-
-## Pure-math GPU NCA prototype
-
-<<<<<<< ours
-
-A Python prototype is available at `src/pure_math_gpu_nca.py`. It uses the required CLIP ViT text encoder for prompt embeddings, then runs the NCA neural-network rollout as explicit CuPy mathematics on the GPU. Matplotlib is used to save or display the generated output. The NCA path avoids `torch.nn`, torchvision, diffusers, and custom CUDA/C++ code. Dataset training uses Pillow and SciPy only to read Flowers102 images and `.mat` split files, and the default trainer uses backprop through explicit tensor operations before exporting `.npz` weights back to the CuPy inference path.
-=======
-A Python prototype is available at `src/pure_math_gpu_nca.py`. It uses the required CLIP ViT text encoder for prompt embeddings, then runs the NCA neural-network rollout as explicit CuPy mathematics on the GPU. Matplotlib is used to save or display the generated output. The NCA path avoids `torch.nn`, torchvision, diffusers, PIL, and custom CUDA/C++ code.
->>>>>>> theirs
-=======
-A Python prototype is available at `src/pure_math_gpu_nca.py`. It uses the required CLIP ViT text encoder for prompt embeddings, then runs the NCA neural-network rollout as explicit CuPy mathematics on the GPU. Matplotlib is used to save or display the generated output. The NCA path avoids `torch.nn`, torchvision, diffusers, PIL, and custom CUDA/C++ code.
->>>>>>> theirs
-
-Install the runtime pieces you actually need:
+Use a Python virtual environment, then install the runtime dependencies:
 
 ```sh
-pip install torch matplotlib
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-pip install pillow scipy
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
+pip install torch matplotlib pillow scipy
 pip install git+https://github.com/openai/CLIP.git
-pip install cupy-cuda12x  # choose the CuPy wheel matching your CUDA version
+pip install cupy-cuda12x  # Choose the CuPy wheel matching your CUDA version.
 ```
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-Train CuPy NCA weights on the local Flowers102 dataset:
+The generator requires a CUDA-capable CuPy installation. Pillow and SciPy are needed only for local Flowers102 training.
 
-```sh
-python src/pure_math_gpu_nca.py "yellow iris" --train --train-iters 200 --train-samples 16 --width 64 --height 64 --steps 24
-```
-
-This reads `src/.dataset/flowers102/flowers-102`, optimizes NCA arrays with backpropagation through the rollout, and saves weights to `src/checkpoints/pure_math_flowers102_nca.npz`. The old finite-difference trainer is still available with `--train-method spsa`.
-
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-Run a generation:
+## Generate an image
 
 ```sh
 python src/pure_math_gpu_nca.py "yellow iris" --output yellow_iris.png --width 128 --height 128 --steps 48 --show
 ```
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-Generate with trained weights:
+Generate with previously trained weights:
 
 ```sh
 python src/pure_math_gpu_nca.py "yellow iris" --weights src/checkpoints/pure_math_flowers102_nca.npz --output yellow_iris_trained.png --show
 ```
 
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-See [`docs/PROJECT_UNDERSTANDING.md`](./docs/PROJECT_UNDERSTANDING.md) for a cell-by-cell explanation of `src/file.ipynb`, the dependency gap, and the migration path from the notebook to the CLIP-conditioned CuPy NCA implementation.
+## Train on Flowers102
 
-## Checkpoints
+Place the dataset at `src/.dataset/flowers102/flowers-102`, containing `jpg/`, `imagelabels.mat`, and `setid.mat`, then run:
 
-Pretrained model weights for various flowers will be in `src/checkpoints/`. You can use these to skip training and directly generate images.
+```sh
+python src/pure_math_gpu_nca.py "yellow iris" --train --train-iters 200 --train-samples 16 --width 64 --height 64 --steps 24
+```
 
-## Requirements
+Backpropagation is the default training method. The default `--train-target exemplar` learns a single reference photo, which is the recommended mode for a sharp deterministic result; `--train-target mean` deliberately learns a softer class average. The trainer also includes a positional feature basis and an adjacent-pixel detail loss; tune the latter with `--detail-loss-weight`.
 
-- Python 3.8+
-- PyTorch
-- OpenAI CLIP
-- CuPy (for the pure-math GPU NCA prototype)
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-- Pillow and SciPy (for local Flowers102 training)
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-- torchvision
-- matplotlib
-- diffusers
-- transformers
-- accelerate
-- safetensors
+Use `--train-method spsa` for the finite-difference alternative. Training evaluates held-out validation images by default; configure this with `--validation-split` and `--validation-samples`. CLIP remains frozen in all training scopes; `--train-scope all` additionally trains the NCA's CLIP projection arrays.
+
+The trained weights are saved to `src/checkpoints/pure_math_flowers102_nca.npz` by default.
+
+## Verify backend parity
+
+The regression test checks that CuPy inference and the Torch backprop rollout produce matching results for the same weights, conditioning vector, masks, and pigment setting:
+
+```sh
+python -m unittest tests/test_rollout_parity.py -v
+```
+
+See [`docs/PROJECT_UNDERSTANDING.md`](./docs/PROJECT_UNDERSTANDING.md) for a cell-by-cell explanation of the earlier notebook and the migration path to the CLIP-conditioned CuPy NCA.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
+This project is licensed under the MIT License. It is intended for research and educational use.
 
-If you use this code or ideas in your research, please cite the associated research paper:
+If you use this work in research, please cite:
 
-> Conditional Image Generation with Vision Transformers and Neural Cellular Automata  
-> *Author(s): Utkaarsh Saha, Alan Muthappan Rebeira, Dr. Shabnam Sadeghi Esfahlani*  
-> *Year: 2025*  
+> Conditional Image Generation with Vision Transformers and Neural Cellular Automata
+>
+> *Utkaarsh Saha, Alan Muthappan Rebeira, Dr. Shabnam Sadeghi Esfahlani*
+>
 > *Anglia Ruskin University, EBE Conference 2025*
-> *Paper Under Review*
-
-This project is intended for research and educational purposes.
-Use at your own risk.
+>
+> *Paper under review*

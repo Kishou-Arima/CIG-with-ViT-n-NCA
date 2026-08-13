@@ -11,11 +11,17 @@ TAU = 2.0 * math.pi
 CLIP_DIM = 512
 COND_DIM = 128
 STATE_CH = 32
+SPATIAL_FEATURE_START = 3
+SPATIAL_FEATURE_CH = 8
+SPATIAL_FEATURE_STOP = SPATIAL_FEATURE_START + SPATIAL_FEATURE_CH
 PERCEPT_CH = 64
 HIDDEN_CH = 64
 DEFAULT_STEPS = 48
 DEFAULT_UPDATE_RATE = 0.5
 DEFAULT_PIGMENT_STRENGTH = 0.0
+DEFAULT_GRAD_CLIP = 1.0
+DEFAULT_WEIGHT_CLIP = 5.0
+DEFAULT_DETAIL_LOSS_WEIGHT = 0.15
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = SCRIPT_DIR / ".dataset" / "flowers102" / "flowers-102"
 DEFAULT_SAVE_WEIGHTS = SCRIPT_DIR / "checkpoints" / "pure_math_flowers102_nca.npz"
@@ -336,6 +342,24 @@ def load_training_images(paths: list[Path], width: int, height: int) -> list[np.
     return images
 
 
+def select_training_target(images: list[object], target_mode: str):
+    """Choose the deterministic image target used by the single-seed NCA.
+
+    A deterministic rollout cannot represent every differently composed photo
+    of one class. ``exemplar`` therefore preserves one real image's detail;
+    ``mean`` is retained for experiments that intentionally learn a class
+    average.
+    """
+
+    if target_mode == "exemplar":
+        return images[0]
+    if target_mode == "mean":
+        if torch is not None and isinstance(images[0], torch.Tensor):
+            return torch.stack(images, dim=0).mean(dim=0)
+        return np.mean(np.stack(images, axis=0), axis=0, dtype=np.float32)
+    raise ValueError(f"Unknown training target mode: {target_mode}")
+
+
 def clip_text_embedding(prompt: str, clip_model_name: str, clip_device: str):
     """Use CLIP's ViT text tower to produce a normalized 512-D embedding."""
 
@@ -375,22 +399,35 @@ def coordinate_grid(width: int, height: int):
     return nx, ny
 
 
+def spatial_features(nx, ny, array_api):
+    """Fixed positional channels that let the NCA learn non-radial structure."""
+
+    radial = array_api.sqrt(nx * nx + ny * ny)
+    features = array_api.stack(
+        [nx, ny, nx * ny, radial, array_api.sin(math.pi * nx), array_api.sin(math.pi * ny), array_api.cos(math.pi * nx), array_api.cos(math.pi * ny)],
+        axis=0,
+    )
+    return features.to(array_api.float32) if hasattr(features, "to") else features.astype(array_api.float32)
+
+
 def seed_state(width: int, height: int, cond):
     """Create a central hidden-state seed for NCA growth."""
 
     array_api = xp()
     state = array_api.zeros((STATE_CH, height, width), dtype=array_api.float32)
     nx, ny = coordinate_grid(width, height)
+    fixed_spatial = spatial_features(nx, ny, array_api)
+    state[SPATIAL_FEATURE_START:SPATIAL_FEATURE_STOP] = fixed_spatial
     seed = array_api.exp(-90.0 * (nx * nx + ny * ny)).astype(array_api.float32)
 
-    for channel in range(3, STATE_CH):
+    for channel in range(SPATIAL_FEATURE_STOP, STATE_CH):
         phase = cond[channel % COND_DIM] * TAU
         state[channel] = seed * (0.5 + 0.5 * array_api.sin(phase + float(channel)))
 
     state[0] = 0.03 * seed
     state[1] = 0.025 * seed
     state[2] = 0.02 * seed
-    return state, nx, ny
+    return state, nx, ny, fixed_spatial
 
 
 def conv3x3_same(state, kernel):
@@ -409,8 +446,8 @@ def conv3x3_same(state, kernel):
     return result
 
 
-def deterministic_mask(width: int, height: int, step: int, update_rate: float):
-    """Deterministic stochastic update mask computed on GPU."""
+def deterministic_masks(width: int, height: int, steps: int, update_rate: float) -> list[object]:
+    """Precompute deterministic update masks once for a fixed rollout shape."""
 
     array_api = xp()
     y, x = array_api.meshgrid(
@@ -418,11 +455,16 @@ def deterministic_mask(width: int, height: int, step: int, update_rate: float):
         array_api.arange(width, dtype=array_api.float32),
         indexing="ij",
     )
-    noise = fract(array_api.sin(x * 12.9898 + y * 78.233 + step * 37.719) * 43758.5453)
-    return (noise <= update_rate).astype(array_api.float32).reshape(1, height, width)
+    base_phase = x * 12.9898 + y * 78.233
+    return [
+        (fract(array_api.sin(base_phase + step * 37.719) * 43758.5453) <= update_rate)
+        .astype(array_api.float32)
+        .reshape(1, height, width)
+        for step in range(steps)
+    ]
 
 
-def nca_step(state, cond, weights: dict[str, object], step: int, update_rate: float, nx, ny, pigment_strength: float):
+def nca_step(state, cond, weights: dict[str, object], mask, nx, ny, fixed_spatial, pigment_strength: float):
     """One FiLM-conditioned NCA update, all in CuPy math."""
 
     array_api = xp()
@@ -442,8 +484,9 @@ def nca_step(state, cond, weights: dict[str, object], step: int, update_rate: fl
         + weights["update_b2"].reshape(STATE_CH, 1, 1)
     )
 
-    next_state = state + 0.025 * delta * deterministic_mask(state.shape[2], state.shape[1], step, update_rate)
-    next_state[3:] *= 0.992
+    next_state = state + 0.025 * delta * mask
+    next_state[SPATIAL_FEATURE_STOP:] *= 0.992
+    next_state[SPATIAL_FEATURE_START:SPATIAL_FEATURE_STOP] = fixed_spatial
 
     if pigment_strength != 0.0:
         angle = array_api.arctan2(ny, nx)
@@ -468,9 +511,10 @@ def nca_rollout(
 ):
     """Run the NCA forward rollout and return RGB output plus final state."""
 
-    state, nx, ny = seed_state(width, height, cond)
-    for step in range(steps):
-        state = nca_step(state, cond, weights, step, update_rate, nx, ny, pigment_strength)
+    state, nx, ny, fixed_spatial = seed_state(width, height, cond)
+    masks = deterministic_masks(width, height, steps, update_rate)
+    for mask in masks:
+        state = nca_step(state, cond, weights, mask, nx, ny, fixed_spatial, pigment_strength)
     rgb = cp.clip(state[:3], 0.0, 1.0).transpose(1, 2, 0)
     return rgb, state
 
@@ -484,7 +528,11 @@ def target_loss(weights: dict[str, object], cond, target_rgb, args: argparse.Nam
 
 
 def trainable_weight_keys(scope: str) -> list[str]:
-    """Select which mathematical NCA arrays are optimized by SPSA."""
+    """Select trainable math weights; CLIP itself is always frozen.
+
+    ``output`` means only the final NCA update projection.  The learned CLIP
+    projection (``cond_w``/``cond_b``) is included only in ``all``.
+    """
 
     scopes = {
         "output": ["update_w2", "update_b2"],
@@ -520,6 +568,14 @@ def torch_from_weights(weights: dict[str, object], device: str, train_keys: list
     return tensor_weights
 
 
+def torch_project_clip_to_condition(clip_embedding, weights: dict[str, object]):
+    """Torch equivalent of the frozen-CLIP, trainable-projection stage."""
+
+    z = clip_embedding / torch.clamp(torch.linalg.norm(clip_embedding), min=1.0e-8)
+    cond = torch.tanh(z @ weights["cond_w"] + weights["cond_b"])
+    return cond / torch.clamp(torch.linalg.norm(cond), min=1.0e-8)
+
+
 def save_torch_weights(weights: dict[str, object], output_path: Path) -> None:
     """Save torch tensor weights as .npz arrays consumed by CuPy inference."""
 
@@ -545,6 +601,8 @@ def torch_coordinate_grid(width: int, height: int, device: str):
 def torch_seed_state(width: int, height: int, cond, device: str):
     state = torch.zeros((STATE_CH, height, width), dtype=torch.float32, device=device)
     nx, ny = torch_coordinate_grid(width, height, device)
+    fixed_spatial = spatial_features(nx, ny, torch)
+    state[SPATIAL_FEATURE_START:SPATIAL_FEATURE_STOP] = fixed_spatial
     seed = torch.exp(-90.0 * (nx * nx + ny * ny)).to(torch.float32)
 
     channels = []
@@ -555,11 +613,13 @@ def torch_seed_state(width: int, height: int, cond, device: str):
             channels.append(0.025 * seed)
         elif channel == 2:
             channels.append(0.02 * seed)
+        elif channel < SPATIAL_FEATURE_STOP:
+            channels.append(fixed_spatial[channel - SPATIAL_FEATURE_START])
         else:
             phase = cond[channel % COND_DIM] * TAU
             channels.append(seed * (0.5 + 0.5 * torch.sin(phase + float(channel))))
     state = torch.stack(channels, dim=0)
-    return state, nx, ny
+    return state, nx, ny, fixed_spatial
 
 
 def torch_conv3x3_same(state, kernel):
@@ -567,17 +627,22 @@ def torch_conv3x3_same(state, kernel):
     return torch.nn.functional.conv2d(padded, kernel).squeeze(0)
 
 
-def torch_deterministic_mask(width: int, height: int, step: int, update_rate: float, device: str):
+def torch_deterministic_masks(width: int, height: int, steps: int, update_rate: float, device: str) -> list[object]:
     y, x = torch.meshgrid(
         torch.arange(height, dtype=torch.float32, device=device),
         torch.arange(width, dtype=torch.float32, device=device),
         indexing="ij",
     )
-    noise = torch_fract(torch.sin(x * 12.9898 + y * 78.233 + step * 37.719) * 43758.5453)
-    return (noise <= update_rate).to(torch.float32).reshape(1, height, width)
+    base_phase = x * 12.9898 + y * 78.233
+    return [
+        (torch_fract(torch.sin(base_phase + step * 37.719) * 43758.5453) <= update_rate)
+        .to(torch.float32)
+        .reshape(1, height, width)
+        for step in range(steps)
+    ]
 
 
-def torch_nca_step(state, cond, weights: dict[str, object], step: int, update_rate: float, nx, ny, pigment_strength: float):
+def torch_nca_step(state, cond, weights: dict[str, object], mask, nx, ny, fixed_spatial, pigment_strength: float):
     perception = torch_conv3x3_same(state, weights["perc_w"])
     film = cond @ weights["film_w"] + weights["film_b"]
     gamma, beta = film[:PERCEPT_CH], film[PERCEPT_CH:]
@@ -592,11 +657,13 @@ def torch_nca_step(state, cond, weights: dict[str, object], step: int, update_ra
         + weights["update_b2"].reshape(STATE_CH, 1, 1)
     )
 
-    mask = torch_deterministic_mask(state.shape[2], state.shape[1], step, update_rate, state.device)
     next_state = state + 0.025 * delta * mask
     decay = torch.ones((STATE_CH, 1, 1), dtype=torch.float32, device=state.device)
-    decay[3:] = 0.992
+    decay[SPATIAL_FEATURE_STOP:] = 0.992
     next_state = next_state * decay
+    next_state = torch.cat(
+        [next_state[:SPATIAL_FEATURE_START], fixed_spatial, next_state[SPATIAL_FEATURE_STOP:]], dim=0
+    )
 
     if pigment_strength != 0.0:
         angle = torch.atan2(ny, nx)
@@ -612,13 +679,16 @@ def torch_nca_step(state, cond, weights: dict[str, object], step: int, update_ra
 
 
 def torch_nca_rollout(cond, weights: dict[str, object], width: int, height: int, steps: int, update_rate: float, pigment_strength: float):
-    state, nx, ny = torch_seed_state(width, height, cond, cond.device)
-    for step in range(steps):
-        state = torch_nca_step(state, cond, weights, step, update_rate, nx, ny, pigment_strength)
+    state, nx, ny, fixed_spatial = torch_seed_state(width, height, cond, cond.device)
+    masks = torch_deterministic_masks(width, height, steps, update_rate, cond.device)
+    for mask in masks:
+        state = torch_nca_step(state, cond, weights, mask, nx, ny, fixed_spatial, pigment_strength)
     return torch.clamp(state[:3], 0.0, 1.0).permute(1, 2, 0), state
 
 
-def manual_adam_step(params: list[object], moments: dict[int, tuple[object, object]], step: int, learning_rate: float) -> None:
+def manual_adam_step(
+    params: list[object], moments: dict[int, tuple[object, object]], step: int, learning_rate: float, grad_clip: float, weight_clip: float
+) -> None:
     beta1 = 0.9
     beta2 = 0.999
     eps = 1.0e-8
@@ -630,14 +700,22 @@ def manual_adam_step(params: list[object], moments: dict[int, tuple[object, obje
             if ident not in moments:
                 moments[ident] = (torch.zeros_like(param), torch.zeros_like(param))
             m, v = moments[ident]
-            grad = torch.clamp(param.grad, -1.0, 1.0)
+            grad = torch.clamp(param.grad, -grad_clip, grad_clip)
             m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
             v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
             m_hat = m / (1.0 - beta1**step)
             v_hat = v / (1.0 - beta2**step)
             param.addcdiv_(m_hat, torch.sqrt(v_hat) + eps, value=-learning_rate)
-            param.clamp_(-5.0, 5.0)
+            param.clamp_(-weight_clip, weight_clip)
             param.grad = None
+
+
+def torch_detail_loss(rgb, target):
+    """L1 loss on adjacent-pixel differences to retain edges and petals."""
+
+    horizontal = torch.mean(torch.abs((rgb[:, 1:, :] - rgb[:, :-1, :]) - (target[:, 1:, :] - target[:, :-1, :])))
+    vertical = torch.mean(torch.abs((rgb[1:, :, :] - rgb[:-1, :, :]) - (target[1:, :, :] - target[:-1, :, :])))
+    return horizontal + vertical
 
 
 def train_on_flowers102_backprop(args: argparse.Namespace) -> dict[str, object]:
@@ -649,22 +727,28 @@ def train_on_flowers102_backprop(args: argparse.Namespace) -> dict[str, object]:
     paths = flowers102_image_paths(args.dataset_root, class_name, args.train_split, args.train_samples)
     targets_np = load_training_images(paths, args.width, args.height)
     targets = [torch.tensor(target, dtype=torch.float32, device=device) for target in targets_np]
+    training_target = select_training_target(targets, args.train_target)
+    validation_targets = []
+    if args.validation_split != "none":
+        validation_paths = flowers102_image_paths(args.dataset_root, class_name, args.validation_split, args.validation_samples)
+        validation_targets = [torch.tensor(target, dtype=torch.float32, device=device) for target in load_training_images(validation_paths, args.width, args.height)]
 
     base_weights = load_or_create_nca_weights(Path(args.weights) if args.weights else None)
     keys = trainable_weight_keys(args.train_scope)
     weights = torch_from_weights(base_weights, device, keys)
     embedding = clip_text_embedding(class_name, args.clip_model, device)
-    cond = project_clip_to_condition(embedding, base_weights)
-    cond_t = torch.tensor(cp.asnumpy(cond), dtype=torch.float32, device=device)
+    embedding_t = torch.tensor(cp.asnumpy(embedding), dtype=torch.float32, device=device)
     params = [weights[key] for key in keys]
     moments: dict[int, tuple[object, object]] = {}
 
     torch.manual_seed(args.seed)
-    print(f"Backprop training on {len(targets)} Flowers102 image(s) for class {class_name!r}.")
+    print(f"Backprop training on {len(targets)} Flowers102 image(s) for class {class_name!r} using a {args.train_target} target.")
+    if validation_targets:
+        print(f"Validating on {len(validation_targets)} held-out {args.validation_split} image(s).")
     print(f"Optimizing {', '.join(keys)}; saving to {args.save_weights}.")
 
     for iteration in range(1, args.train_iters + 1):
-        target = targets[(iteration - 1) % len(targets)]
+        cond_t = torch_project_clip_to_condition(embedding_t, weights)
         rgb, _ = torch_nca_rollout(
             cond_t,
             weights,
@@ -674,14 +758,22 @@ def train_on_flowers102_backprop(args: argparse.Namespace) -> dict[str, object]:
             args.update_rate,
             args.pigment_strength,
         )
-        mse = torch.mean((rgb - target) ** 2)
-        l1 = torch.mean(torch.abs(rgb - target))
-        loss = mse + 0.25 * l1
+        mse = torch.mean((rgb - training_target) ** 2)
+        l1 = torch.mean(torch.abs(rgb - training_target))
+        detail = torch_detail_loss(rgb, training_target)
+        loss = mse + 0.25 * l1 + args.detail_loss_weight * detail
         loss.backward()
-        manual_adam_step(params, moments, iteration, args.learning_rate)
+        manual_adam_step(params, moments, iteration, args.learning_rate, args.grad_clip, args.weight_clip)
 
         if iteration == 1 or iteration % args.log_every == 0 or iteration == args.train_iters:
-            print(f"iter {iteration:05d}/{args.train_iters}: loss={float(loss.detach()):.6f} mse={float(mse.detach()):.6f} l1={float(l1.detach()):.6f}")
+            message = f"iter {iteration:05d}/{args.train_iters}: loss={float(loss.detach()):.6f} mse={float(mse.detach()):.6f} l1={float(l1.detach()):.6f} detail={float(detail.detach()):.6f}"
+            if validation_targets:
+                with torch.no_grad():
+                    cond_t = torch_project_clip_to_condition(embedding_t, weights)
+                    validation_rgb, _ = torch_nca_rollout(cond_t, weights, args.width, args.height, args.steps, args.update_rate, args.pigment_strength)
+                    validation_loss = torch.stack([torch.mean((validation_rgb - target) ** 2) for target in validation_targets]).mean()
+                message += f" val_mse={float(validation_loss):.6f}"
+            print(message)
 
     save_torch_weights(weights, Path(args.save_weights))
     return {key: cp.asarray(value.detach().cpu().numpy(), dtype=cp.float32) for key, value in weights.items()}
@@ -700,18 +792,24 @@ def train_on_flowers102(args: argparse.Namespace) -> dict[str, object]:
     class_name = args.train_class or args.prompt
     paths = flowers102_image_paths(args.dataset_root, class_name, args.train_split, args.train_samples)
     targets = load_training_images(paths, args.width, args.height)
+    training_target_np = select_training_target(targets, args.train_target)
+    validation_targets = []
+    if args.validation_split != "none":
+        validation_paths = flowers102_image_paths(args.dataset_root, class_name, args.validation_split, args.validation_samples)
+        validation_targets = load_training_images(validation_paths, args.width, args.height)
     weights = load_or_create_nca_weights(Path(args.weights) if args.weights else None)
     embedding = clip_text_embedding(class_name, args.clip_model, args.clip_device)
     cond = project_clip_to_condition(embedding, weights)
     keys = trainable_weight_keys(args.train_scope)
 
     cp.random.seed(args.seed)
-    print(f"Training on {len(targets)} Flowers102 image(s) for class {class_name!r}.")
+    print(f"Training on {len(targets)} Flowers102 image(s) for class {class_name!r} using a {args.train_target} target.")
+    if validation_targets:
+        print(f"Validating on {len(validation_targets)} held-out {args.validation_split} image(s).")
     print(f"Optimizing {', '.join(keys)} with SPSA; saving to {args.save_weights}.")
 
     for iteration in range(1, args.train_iters + 1):
-        target_np = targets[(iteration - 1) % len(targets)]
-        target = cp.asarray(target_np, dtype=cp.float32)
+        target = cp.asarray(training_target_np, dtype=cp.float32)
         perturbations = {
             key: cp.where(cp.random.random(weights[key].shape) < 0.5, -1.0, 1.0).astype(cp.float32) for key in keys
         }
@@ -728,13 +826,19 @@ def train_on_flowers102(args: argparse.Namespace) -> dict[str, object]:
         for key in keys:
             weights[key] += args.spsa_eps * perturbations[key]
             weights[key] -= args.learning_rate * scale * perturbations[key]
-            weights[key] = cp.clip(weights[key], -5.0, 5.0)
+            weights[key] = cp.clip(weights[key], -args.weight_clip, args.weight_clip)
 
         if iteration == 1 or iteration % args.log_every == 0 or iteration == args.train_iters:
-            current_loss = float(target_loss(weights, cond, target, args).get())
             plus = float(loss_plus.get())
             minus = float(loss_minus.get())
-            print(f"iter {iteration:05d}/{args.train_iters}: loss={current_loss:.6f} spsa+= {plus:.6f} spsa-= {minus:.6f}")
+            message = f"iter {iteration:05d}/{args.train_iters}: loss_estimate={(plus + minus) / 2.0:.6f} spsa+= {plus:.6f} spsa-= {minus:.6f}"
+            if validation_targets:
+                validation_losses = [
+                    target_loss(weights, cond, cp.asarray(target_np, dtype=cp.float32), args) for target_np in validation_targets
+                ]
+                validation_loss = float(cp.mean(cp.stack(validation_losses)).get())
+                message += f" val_mse={validation_loss:.6f}"
+            print(message)
 
     save_nca_weights(weights, Path(args.save_weights))
     return weights
@@ -800,16 +904,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-iters", type=int, default=200, help="Number of training iterations.")
     parser.add_argument("--train-samples", type=int, default=16, help="Maximum class images to keep in memory; 0 means all.")
     parser.add_argument(
+        "--train-target",
+        choices=["exemplar", "mean"],
+        default="exemplar",
+        help="Single deterministic target: exemplar preserves one photo's detail; mean learns a softer class average.",
+    )
+    parser.add_argument(
         "--train-scope",
         choices=["output", "update", "all"],
         default="update",
-        help="Which NCA weight arrays training should optimize.",
+        help="Weights to optimize: output=final update projection; update=FiLM and update layers; all=also CLIP projection (CLIP stays frozen).",
     )
     parser.add_argument("--learning-rate", type=float, default=0.002, help="Training learning rate.")
     parser.add_argument("--spsa-eps", type=float, default=0.01, help="SPSA perturbation size.")
+    parser.add_argument("--detail-loss-weight", type=float, default=DEFAULT_DETAIL_LOSS_WEIGHT, help="Weight of adjacent-pixel detail loss in backprop training.")
+    parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP, help="Maximum absolute backprop gradient before Adam updates.")
+    parser.add_argument("--weight-clip", type=float, default=DEFAULT_WEIGHT_CLIP, help="Maximum absolute value for trained weights.")
     parser.add_argument("--save-weights", default=str(DEFAULT_SAVE_WEIGHTS), help="Path for trained .npz NCA weights.")
     parser.add_argument("--log-every", type=int, default=10, help="Training log interval.")
     parser.add_argument("--seed", type=int, default=7, help="Deterministic seed for SPSA perturbations.")
+    parser.add_argument(
+        "--validation-split",
+        choices=["none", "train", "val", "test", "trainval", "all"],
+        default="val",
+        help="Held-out Flowers102 split evaluated at each log interval; use none to disable.",
+    )
+    parser.add_argument("--validation-samples", type=int, default=4, help="Maximum validation images to keep in memory; 0 means all.")
     parser.add_argument(
         "--dataset-root",
         default=str(DEFAULT_DATASET_ROOT),
@@ -835,8 +955,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--learning-rate must be positive.")
     if args.spsa_eps <= 0.0:
         raise ValueError("--spsa-eps must be positive.")
+    if args.detail_loss_weight < 0.0:
+        raise ValueError("--detail-loss-weight must be non-negative.")
+    if args.grad_clip <= 0.0 or args.weight_clip <= 0.0:
+        raise ValueError("--grad-clip and --weight-clip must be positive.")
     if args.log_every <= 0:
         raise ValueError("--log-every must be positive.")
+    if args.validation_samples < 0:
+        raise ValueError("--validation-samples must be non-negative.")
+    if args.train and args.pigment_strength != 0.0:
+        raise ValueError("--pigment-strength must be 0 during training; analytic pigment would change the training target.")
     args.dataset_root = resolve_flowers102_root(args.dataset_root)
 
 
